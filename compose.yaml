@@ -1,0 +1,155 @@
+name: mihomo-stack
+
+# 开发/演练栈：与生产完全隔离（独立 compose 项目、独立 volume、独立端口、bridge 网络）。
+# 生产栈继续用 host 网络与固定端口；这里一律改成 127.0.0.1 高位端口。
+#
+# 首次使用：
+#   cp .env.example .env            # 填 DEV_API_SECRET
+#   bash tools/seed_dev.sh          # 播种 geo 数据文件与订阅池（一次性）
+#   docker compose up -d --build
+#   docker compose run --rm shell update     # 或等 loop 自己跑
+# shell 与 init 共用同一份挂载与环境，避免两处漂移
+x-shell-volumes: &shell-volumes
+  - data:/data
+  - ./shell:/opt/shell:ro
+  - ./tools:/opt/tools:ro
+  - ./schemas:/opt/schemas:ro
+
+x-shell-env: &shell-env
+  - TZ=${TZ:-Asia/Shanghai}
+  - DATA_DIR=/data
+  - SHELL_DIR=/opt/shell
+  - TOOLS_DIR=/opt/tools
+  - SCHEMAS_DIR=/opt/schemas
+  - MIHOMO_CONFIG=/data/artifacts/config.yaml
+  - MIHOMO_API=http://core:9090
+  - MIHOMO_SECRET=${DEV_API_SECRET:?set DEV_API_SECRET in .env}
+  # 生成配置里内核监听的地址：容器内必须 0.0.0.0，否则 shell 连不上
+  - MIHOMO_API_LISTEN=0.0.0.0:9090
+  # 开发栈没有出口容器：留空 -> 不生成 tproxy-port
+  - MIHOMO_TPROXY_PORT=
+  - MIHOMO_MIXED_PORT=7897
+  - PREFER_REGION=${PREFER_REGION:-jp}
+  - SCORE_PLATFORMS=${SCORE_PLATFORMS:-all}
+  - SCORE_SAMPLES=${SCORE_SAMPLES:-2}
+  - REFRESH_INTERVAL=${REFRESH_INTERVAL:-21600}
+  # 分数新鲜度阈值 = 2 × 刷新周期（数据契约）
+  - MIHOMO_SCORES_MAX_AGE=${MIHOMO_SCORES_MAX_AGE:-43200}
+  # 定向站点组（可选）：域名与探针必须成对，留空则不生成该组
+  - MIHOMO_SITE_GROUP=${MIHOMO_SITE_GROUP:-Site出口}
+  - MIHOMO_SITE_DOMAINS=${MIHOMO_SITE_DOMAINS:-}
+  - MIHOMO_SITE_HEALTH_URL=${MIHOMO_SITE_HEALTH_URL:-}
+  - MIHOMO_LOCAL_NODES=/data/secrets/local-nodes.yaml
+  - KEEP_FAILURE=${KEEP_FAILURE:-0}
+
+services:
+  core:
+    image: ${CORE_IMAGE:-metacubex/mihomo:v1.19.33}
+    container_name: mihomo-stack-core
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # 没有出口容器，因此不需要 NET_ADMIN；tproxy 端口由 merge.py 环境变量关掉
+    command: ["-d", "/data/cache", "-f", "/data/artifacts/config.yaml"]
+    # 先让 init 把配置文件写到卷里，再启动内核：否则内核会用内置默认配置起来，
+    # API 绑在 loopback，shell 既连不上、也无法热重载
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - data:/data
+    ports:
+      - "127.0.0.1:${DEV_API_PORT:-19090}:9090"
+      - "127.0.0.1:${DEV_MIXED_PORT:-17897}:7897"
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  shell:
+    build:
+      context: ./shell
+      args:
+        CORE_IMAGE: ${CORE_IMAGE:-metacubex/mihomo:v1.19.33}
+        CORE_BIN: ${CORE_BIN:-/mihomo}
+    image: mihomo-stack-shell:0.1
+    container_name: mihomo-stack-shell
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes: *shell-volumes
+    environment: *shell-env
+    command: ["loop"]
+    depends_on:
+      - core
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  init:
+    build:
+      context: ./shell
+      args:
+        CORE_IMAGE: ${CORE_IMAGE:-metacubex/mihomo:v1.19.33}
+        CORE_BIN: ${CORE_BIN:-/mihomo}
+    image: mihomo-stack-shell:0.1
+    container_name: mihomo-stack-init
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes: *shell-volumes
+    environment: *shell-env
+    command: ["init"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  panel:
+    image: ghcr.io/zephyruso/zashboard:latest
+    container_name: mihomo-stack-panel
+    restart: unless-stopped
+    # 上游镜像用 caddy 起静态站点，写 /data 与 /config；固定只读会直接起不来。
+    # 面板不持有任何密钥（后端地址与 secret 存在浏览器里），因此这里保留上游默认权限。
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /data
+      - /config
+      - /tmp
+    ports:
+      - "127.0.0.1:${DEV_PANEL_PORT:-19091}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  data:

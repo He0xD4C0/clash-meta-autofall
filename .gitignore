@@ -1,0 +1,30 @@
+# 运行期数据与密钥：绝不入库
+/data/
+config.yaml
+subscriptions.yaml
+local-nodes.yaml
+scores.json
+cache.db
+*.tmp
+*.swp
+
+# 失败现场与归档
+/last-failure/
+/archive/
+
+# Python
+.hermes/
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# 本地环境
+.env
+.env.*
+!.env.example
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
