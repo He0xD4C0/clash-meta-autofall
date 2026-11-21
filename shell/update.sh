@@ -36,7 +36,7 @@ fail() { printf 'failed: %s\n' "$*" >&2; exit 1; }
 exec 9>"$LOCK"
 flock -n 9 || { log "another update is running, skipped"; exit 0; }
 
-mkdir -p "$ARTIFACTS" "$CACHE" "$DATA_DIR/archive"
+mkdir -p "$ARTIFACTS" "$CACHE" "$DATA_DIR/archive" "$CACHE/rule-providers"
 TMP=$(mktemp -d "$ARTIFACTS/.tmp.XXXXXX")
 cleanup() {
   if [ -d "$TMP" ]; then
@@ -177,21 +177,48 @@ for group in cfg.get("proxy-groups") or []:
 PY
 }
 
+sync_probe_core() {
+  # 探测内核（global 模式）用同一批节点，节点表变了要重新生成并热重载它。
+  # 失败不影响主流程：纯净度只是评分的一个维度，缺了会按“无数据”处理。
+  [ -n "${PROBE_API:-}" ] || return 0
+  "$PY" "$SHELL_DIR/make_probe_config.py" "$ARTIFACTS/config.yaml" \
+    "$ARTIFACTS/probe-config.yaml" --secret "$SECRET" >/dev/null \
+    || { log "probe config generation failed"; return 0; }
+  "$PY" "${TOOLS_DIR:-/opt/tools}/reload.py" "$PROBE_API" "$SECRET" \
+    "$ARTIFACTS/probe-config.yaml" --retries 5 --delay 1 >/dev/null 2>&1 \
+    && log "probe core synced" || log "probe core reload skipped"
+}
+
 SECRET=$MIHOMO_SECRET
 export MIHOMO_CONFIG=$CONFIG MIHOMO_SECRET=$SECRET MIHOMO_API=$API MIHOMO_SCORES=$SCORES
 
 # 5) 首次启动（INIT_ONLY）：内核尚未运行，只落盘不重载
 if [ "${INIT_ONLY:-0}" = "1" ]; then
   install_config "$TMP/config.yaml"
+  # probe-core 依赖 init 完成后再启动，所以这里必须把它的配置也准备好
+  "$PY" "$SHELL_DIR/make_probe_config.py" "$ARTIFACTS/config.yaml" \
+    "$ARTIFACTS/probe-config.yaml" --secret "$SECRET" >/dev/null 2>&1 || true
   log "bootstrap config installed (init mode)"
   exit 0
 fi
 
 # 5) 先热重载（body 取自临时文件），成功后才落盘：重载被拒时磁盘仍是旧配置
 reload_and_install "$TMP/config.yaml"
+sync_probe_core
 warm "$ARTIFACTS/config.yaml"
 
 if [ "${SKIP_SCORE:-0}" != "1" ]; then
+  # 纯净度必须在评分之前：score.py 读同一份快照，把住宅/机房/代理/地区虚标算进总分
+  if [ "${PURITY_ENABLED:-1}" = "1" ] && [ -n "${PROBE_API:-}" ]; then
+    log "probing purity (exit IP per node, pace ${PURITY_PACE:-1.5}s)"
+    "$PY" "${TOOLS_DIR:-/opt/tools}/purity.py" --pace "${PURITY_PACE:-1.5}" \
+      --json "${MIHOMO_PURITY:-$ARTIFACTS/purity.json}" --top 5 \
+      || log "purity probe unavailable - scoring continues without it"
+    stamp_p=$(date +%Y%m%dT%H%M%S)
+    [ -f "${MIHOMO_PURITY:-$ARTIFACTS/purity.json}" ] && \
+      gzip -c "${MIHOMO_PURITY:-$ARTIFACTS/purity.json}" >"$DATA_DIR/archive/purity-$stamp_p.json.gz"
+    ls -1 "$DATA_DIR/archive"/purity-*.json.gz 2>/dev/null | sort | head -n -7 | xargs -r rm -f
+  fi
   log "scoring (platforms=$SCORE_PLATFORMS samples=$SCORE_SAMPLES prefer=$PREFER_REGION)"
   "$PY" "$SHELL_DIR/score.py" --platforms "$SCORE_PLATFORMS" --samples "$SCORE_SAMPLES" \
     --prefer "$PREFER_REGION" --prefer-bonus "$PREFER_BONUS" --json "$SCORES" --top 0

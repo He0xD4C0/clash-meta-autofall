@@ -14,6 +14,7 @@ x-shell-volumes: &shell-volumes
   - ./shell:/opt/shell:ro
   - ./tools:/opt/tools:ro
   - ./schemas:/opt/schemas:ro
+  - ./rules:/opt/rules:ro
 
 x-shell-env: &shell-env
   - TZ=${TZ:-Asia/Shanghai}
@@ -40,6 +41,24 @@ x-shell-env: &shell-env
   - MIHOMO_SITE_DOMAINS=${MIHOMO_SITE_DOMAINS:-}
   - MIHOMO_SITE_HEALTH_URL=${MIHOMO_SITE_HEALTH_URL:-}
   - MIHOMO_LOCAL_NODES=/data/secrets/local-nodes.yaml
+  # curated 规则层（rules/henrychiao.yaml）；SUB_RULES=0 表示丢弃订阅自带规则
+  - MIHOMO_RULESET=/opt/rules/henrychiao.yaml
+  - MIHOMO_SUB_RULES=${MIHOMO_SUB_RULES:-0}
+  # 规则集下载路径：DIRECT（默认，直连 github）或某个组名（如 出口）
+  - MIHOMO_RULESET_PROXY=${MIHOMO_RULESET_PROXY:-DIRECT}
+  # 评分快照：merge/score/ui 三处共用，显式给值，避免落到脚本目录
+  - MIHOMO_SCORES=/data/artifacts/scores.json
+  # 探测内核（按节点发请求、测真实出口 IP）
+  - PROBE_API=http://probe-core:9090
+  - PROBE_PROXY=http://probe-core:7899
+  - MIHOMO_PURITY=/data/artifacts/purity.json
+  # 巡检与纯净度
+  - RUN_LOG=/data/run.log
+  - WATCHDOG_INTERVAL=${WATCHDOG_INTERVAL:-300}
+  - PURITY_ENABLED=${PURITY_ENABLED:-1}
+  - PURITY_PACE=${PURITY_PACE:-1.5}
+  - MIHOMO_PURITY_WEIGHT=${MIHOMO_PURITY_WEIGHT:-0.10}
+  - UI_PORT=8080
   - KEEP_FAILURE=${KEEP_FAILURE:-0}
 
 services:
@@ -92,7 +111,8 @@ services:
       - ALL
     volumes: *shell-volumes
     environment: *shell-env
-    command: ["loop"]
+    # scheduler = 5 分钟巡检 + 6 小时「纯净度→评分→重排→热重载」
+    command: ["scheduler"]
     depends_on:
       - core
     logging:
@@ -126,6 +146,33 @@ services:
         max-size: "5m"
         max-file: "2"
 
+  # 探测内核：同一批节点、global 模式、无规则。用来"按节点发请求"，
+  # 从而拿到每个节点真实的出口 IP 与属地（IP 纯净度测法的前提）。
+  probe-core:
+    image: ${CORE_IMAGE:-metacubex/mihomo:v1.19.33}
+    container_name: mihomo-stack-probe-core
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["-d", "/data/probe", "-f", "/data/artifacts/probe-config.yaml"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - data:/data
+    ports:
+      - "127.0.0.1:${DEV_PROBE_API_PORT:-19092}:9090"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
   panel:
     image: ghcr.io/zephyruso/zashboard:latest
     container_name: mihomo-stack-panel
@@ -145,6 +192,36 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # 自建状态面板：评分 / 纯净度 / 当前选路 / 巡检日志
+  ui:
+    build:
+      context: ./shell
+      args:
+        CORE_IMAGE: ${CORE_IMAGE:-metacubex/mihomo:v1.19.33}
+        CORE_BIN: ${CORE_BIN:-/mihomo}
+    image: mihomo-stack-shell:0.1
+    container_name: mihomo-stack-ui
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes: *shell-volumes
+    environment: *shell-env
+    command: ["ui"]
+    depends_on:
+      - core
+    ports:
+      - "127.0.0.1:${DEV_UI_PORT:-19093}:8080"
     logging:
       driver: json-file
       options:

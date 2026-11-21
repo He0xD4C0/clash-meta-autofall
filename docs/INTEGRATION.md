@@ -19,19 +19,29 @@
 ## 2. 服务拓扑
 
 ```
-panel :19091 ──(浏览器直连 API)──┐
-                                 ▼
-                            core :19090 (API) / :17897 (mixed，仅 loopback 发布)
-                                 ▲
-                        shell（唯一写方：拉订阅/合并/评分/热重载）
-                                 │
-                      卷 mihomo-stack-data:/data
+ panel :19091 ──(浏览器直连 API)──┐        ui :19093 ──(读快照 + API)──┐
+                                  ▼                                  ▼
+                             core :19090 (API) / :17897 (mixed，仅 loopback 发布)
+                                  ▲                                  ▲
+                         shell（唯一写方：拉订阅/合并/纯净度/评分/巡检/热重载）
+                                  │
+                     probe-core :19092（global 模式，逐节点测出口 IP）
+                                  │
+                       卷 mihomo-stack-data:/data
 ```
 
 * **core** 只跑内核：`-d /data/cache -f /data/artifacts/config.yaml`，只读根文件系统。
 * **shell** 只跑运行时（alpine + python3 + pyyaml + curl + 内核二进制），业务脚本以只读卷
   `./shell:/opt/shell` 注入，**改策略不重建镜像**。
+* 规则层以只读卷 `./rules:/opt/rules` 注入（`MIHOMO_RULESET=/opt/rules/henrychiao.yaml`）；
+  `MIHOMO_SUB_RULES=0` 表示只用 curated 规则，`MIHOMO_RULESET_PROXY` 控制 `.mrs` 的下载路径（默认 DIRECT）。
 * **panel** 用上游面板镜像，无服务端出网需求，端口只发布到 loopback。
+* **probe-core** 与 core 同镜像，但 `mode: global`、无规则、DNS 关闭；配置由
+  `shell/make_probe_config.py` 从主配置派生，节点表变化后由 `tools/reload.py` payload 热重载。
+  它的混合端口必须 `allow-lan: true`（shell 容器在别的网段），API 只发布到 loopback。
+* **ui** 与 shell 同镜像、只读根文件系统，只读 `artifacts/` 与 `run.log`，无写权限。
+* 周期任务（`scheduler`）并进 shell 容器：两个独立循环，间隔来自
+  `WATCHDOG_INTERVAL`（默认 300s）与 `REFRESH_INTERVAL`（默认 21600s）。
 
 ## 3. 卷与持久化
 
@@ -40,9 +50,11 @@ panel :19091 ──(浏览器直连 API)──┐
 ```
 /data/secrets/       订阅池与手工节点（0600）
 /data/assets/        geoip.metadb / geosite.dat（由 tools/seed_dev.sh 播种）
-/data/artifacts/     生成的 config.yaml、scores.json
+/data/artifacts/     生成的 config.yaml、probe-config.yaml、scores.json、purity.json
+/data/probe/         probe-core 的 -d 目录（cache.db）
 /data/cache/         内核的 -d 目录：cache.db 与 geo 副本
-/data/archive/       评分归档（最多 7 份）
+/data/archive/       评分/纯净度归档（各最多 7 份）
+/data/run.log        巡检与调度日志（单行 JSON，ui 读取）
 /data/last-failure/  失败现场（KEEP_FAILURE=1 时）
 ```
 

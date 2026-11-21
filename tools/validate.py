@@ -52,8 +52,13 @@ def validate_scores(path: str) -> int:
         return _report(errors)
 
     weights = sum(float(v) for v in (doc.get("platforms") or {}).values())
-    if abs(weights - 1.0) > 0.01:
-        print(f"{path}: FAILED\n  platform weights sum to {weights:.3f}, expected 1.0", file=sys.stderr)
+    purity_weight = float(doc.get("purity_weight") or 0.0)
+    if abs(weights + purity_weight - 1.0) > 0.01:
+        print(
+            f"{path}: FAILED\n  platform weights + purity_weight = {weights + purity_weight:.3f},"
+            " expected 1.0",
+            file=sys.stderr,
+        )
         return 1
     nodes = doc["nodes"]
     stale = [n for n, info in nodes.items() if not info.get("platforms")]

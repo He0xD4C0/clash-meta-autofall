@@ -68,5 +68,43 @@ class SiteGroupTests(unittest.TestCase):
             os.environ.pop("MIHOMO_SITE_DOMAINS", None)
 
 
+class RulesetTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["MIHOMO_RULESET"] = os.path.join(
+            ROOT, "tests", "fixtures", "ruleset.tiny.yaml"
+        )
+        self.merge = load("merge_ruleset")
+
+    def tearDown(self):
+        os.environ.pop("MIHOMO_RULESET", None)
+
+    def test_targets_are_mapped_to_local_groups(self):
+        self.assertEqual(self.merge._map_rule("RULE-SET,Ads,REJECT"), "RULE-SET,Ads,REJECT")
+        self.assertEqual(self.merge._map_rule("RULE-SET,CN,国内流量"), "RULE-SET,CN,DIRECT")
+        self.assertEqual(self.merge._map_rule("RULE-SET,AI,人工智能"), "RULE-SET,AI,AI出口")
+        self.assertEqual(
+            self.merge._map_rule("DOMAIN-SUFFIX,example.com,国外流量"),
+            "DOMAIN-SUFFIX,example.com,出口",
+        )
+
+    def test_and_rule_maps_last_segment(self):
+        self.assertEqual(
+            self.merge._map_rule("AND,((DST-PORT,443),(NETWORK,UDP)),REJECT"),
+            "AND,((DST-PORT,443),(NETWORK,UDP)),REJECT",
+        )
+
+    def test_no_resolve_suffix_survives(self):
+        self.assertEqual(
+            self.merge._map_rule("RULE-SET,ProxyIP,国外流量,no-resolve"),
+            "RULE-SET,ProxyIP,出口,no-resolve",
+        )
+
+    def test_ruleset_loads_providers_and_drops_match(self):
+        providers, rules = self.merge._load_ruleset()
+        self.assertEqual(sorted(providers), ["AI", "Ads", "CN"])
+        self.assertEqual(len(rules), 5)
+        self.assertEqual(len(self.merge._map_rules(rules)), 5)
+
+
 if __name__ == "__main__":
     unittest.main()

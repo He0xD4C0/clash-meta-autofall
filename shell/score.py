@@ -34,6 +34,7 @@ import json
 import os
 import statistics
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -67,6 +68,16 @@ PLATFORMS = {
 SITE_PROBE_URL = os.environ.get("MIHOMO_SITE_HEALTH_URL", "").strip()
 if SITE_PROBE_URL:
     PLATFORMS["site"] = (SITE_PROBE_URL, 0.04)
+
+# IP 纯净度（tools/purity.py 产出）：住宅/移动 100、机房 55、被判定代理 20，
+# 地区虚标再扣 25。它作为一个独立维度参与总分，权重默认 0.10，其余平台按比例让出。
+PURITY_FILE = os.environ.get(
+    "MIHOMO_PURITY", os.path.join(os.path.dirname(CONFIG), "purity.json")
+)
+PURITY_WEIGHT = float(os.environ.get("MIHOMO_PURITY_WEIGHT", "0.10"))
+PURITY_MAX_AGE = int(os.environ.get("MIHOMO_PURITY_MAX_AGE", str(12 * 3600)))
+# 没测到纯净度的节点按"未知偏保守"计分：不测不等于干净，避免未测节点靠缺数据占便宜
+PURITY_MISSING = float(os.environ.get("MIHOMO_PURITY_MISSING", "40"))
 # `ai` and `site` are also the per-group keys used by merge.py; the rest only
 # contribute to the overall score.
 
@@ -178,6 +189,43 @@ def score_platform(samples):
     }
 
 
+def load_purity() -> dict:
+    """name -> 纯净度记录；文件缺失或过期返回空字典（评分退化为纯连通性）。"""
+    try:
+        if time.time() - os.path.getmtime(PURITY_FILE) > PURITY_MAX_AGE:
+            print(
+                f"note: purity snapshot older than {PURITY_MAX_AGE // 3600}h - ignored",
+                file=sys.stderr,
+            )
+            return {}
+        with open(PURITY_FILE, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for name, info in (doc.get("nodes") or {}).items():
+        try:
+            out[str(name)] = {"purity": float(info.get("purity") or 0.0), **info}
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def write_json_atomic(path: str, doc) -> None:
+    """同目录 tmp + rename + fsync：读方永远看不到半份快照。"""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, ensure_ascii=False, indent=1)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    dir_fd = os.open(os.path.dirname(path) or ".", os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="score mihomo nodes per platform")
     ap.add_argument("--platforms", default="all", help="all, or comma separated keys")
@@ -226,12 +274,27 @@ def main() -> int:
             raw.setdefault(name, {})[platform] = score_platform(samples)
 
     weight_sum = sum(PLATFORMS[p][1] for p in chosen)
+    purity_table = load_purity()
+    purity_weight = PURITY_WEIGHT if purity_table else 0.0
+    if purity_table:
+        print(
+            f"note: purity data for {len(purity_table)} node(s), weight={purity_weight:g}",
+            file=sys.stderr,
+        )
     result = {}
     for name, per_platform in raw.items():
-        overall = sum(per_platform[p]["score"] * PLATFORMS[p][1] for p in chosen) / weight_sum
+        platform_part = sum(per_platform[p]["score"] * PLATFORMS[p][1] for p in chosen)
+        purity = purity_table.get(name)
+        if purity_weight:
+            purity_score = purity["purity"] if purity is not None else PURITY_MISSING
+            overall = (platform_part + purity_weight * purity_score) / (
+                weight_sum + purity_weight
+            )
+        else:
+            overall = platform_part / weight_sum
         region = region_of(name)
         bonus = args.prefer_bonus if region in prefer else 0.0
-        result[name] = {
+        entry = {
             "overall": round(overall, 1),
             "final": round(overall + bonus, 1),
             "region": region,
@@ -239,6 +302,18 @@ def main() -> int:
             "bonus": round(bonus, 1),
             "platforms": per_platform,
         }
+        if purity is not None:
+            entry["purity"] = {
+                "score": round(purity["purity"], 1),
+                "ip": purity.get("ip"),
+                "country_code": purity.get("country_code"),
+                "claimed": purity.get("claimed"),
+                "region_match": purity.get("region_match"),
+                "hosting": purity.get("hosting"),
+                "proxy": purity.get("proxy"),
+                "reason": purity.get("reason"),
+            }
+        result[name] = entry
 
     ranked = sorted(result.items(), key=lambda kv: kv[1]["final"], reverse=True)
     stamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -261,21 +336,22 @@ def main() -> int:
         f" prefer={','.join(prefer) or '-'} (+{args.prefer_bonus:g}), {stamp}"
     )
 
-    with open(args.json, "w", encoding="utf-8") as fh:
-        json.dump(
-            {
-                "generated": stamp,
-                "samples": args.samples,
-                # 只跑平台子集时按子集重新归一，保证契约里"权重和=1.0"始终成立
-                "platforms": {p: round(PLATFORMS[p][1] / weight_sum, 6) for p in chosen},
-                "prefer": list(prefer),
-                "prefer_bonus": args.prefer_bonus,
-                "nodes": result,
+    platform_share = 1.0 - purity_weight
+    write_json_atomic(
+        args.json,
+        {
+            "generated": stamp,
+            "samples": args.samples,
+            # 平台权重与 purity_weight 之和恒为 1.0（契约要求），子集运行时按子集归一
+            "platforms": {
+                p: round(PLATFORMS[p][1] / weight_sum * platform_share, 6) for p in chosen
             },
-            fh,
-            ensure_ascii=False,
-            indent=1,
-        )
+            "purity_weight": round(purity_weight, 6),
+            "prefer": list(prefer),
+            "prefer_bonus": args.prefer_bonus,
+            "nodes": result,
+        },
+    )
     print(f"written {args.json}")
     return 0
 

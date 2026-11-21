@@ -199,13 +199,39 @@ def _site_config():
 
 SITE_ENABLED, SITE_HEALTH_URL, SITE_RULES = _site_config()
 
+# 规则层：上游仓库的精简快照（只含 rule-providers 与 rules）。规则里的目标组名保持
+# 上游原样，由 TARGET_MAP 落到本项目的组；缺文件时跳过（测试与最小部署也能跑）。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+RULESET = os.environ.get(
+    "MIHOMO_RULESET", os.path.join(_HERE, os.pardir, "rules", "henrychiao.yaml")
+)
+# 是否保留订阅自带的规则。默认丢弃：订阅规则与 curated 规则集常打架，且会引用
+# 订阅自己的组（U3 之后那些组会被隐藏）。
+SUB_RULES = os.environ.get("MIHOMO_SUB_RULES", "0") not in ("", "0", "false", "no")
+# 规则集下载走哪条路：默认 DIRECT。内核默认按规则路由，而规则里 github 往往指向
+# "国外流量"——出口组还没选好节点时会把规则集拉空（实测 EOF / connection refused）。
+# 本机直连 raw.githubusercontent 可用，所以默认 DIRECT；直连不通的环境改这里。
+RULESET_PROXY = os.environ.get("MIHOMO_RULESET_PROXY", "DIRECT")
+
+# 上游目标组 -> 本项目落点。默认一律 `出口`；表里只列需要区别对待的。
+TARGET_MAP = {
+    "直接连接": "DIRECT",
+    "国内流量": "DIRECT",
+    "抖快书定位": "DIRECT",  # 抖音/快手地区服务，直连保持国内口径
+    "DIRECT": "DIRECT",
+    "REJECT": "REJECT",
+    "人工智能": AI_GROUP,
+}
+TARGET_DEFAULT = EXIT_GROUP
+
 # score.py measures every node per platform (and adds a small bonus for the
 # preferred region). A fallback group serves its first healthy member, so
 # ordering by that score instead of subscription order is what makes selection
 # quality-driven. A stale file is ignored rather than trusted.
+# 评分快照：默认落在数据根的 artifacts/ 下（脚本目录永远不会有运行期数据）
 SCORES = os.environ.get(
     "MIHOMO_SCORES",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "scores.json"),
+    os.path.join(os.environ.get("DATA_DIR", "/data"), "artifacts", "scores.json"),
 )
 # 数据契约：阈值 = 2 × 刷新周期（docs/DATA.md）。默认刷新 6h -> 12h。
 SCORES_MAX_AGE = int(os.environ.get("MIHOMO_SCORES_MAX_AGE", str(12 * 3600)))
@@ -388,6 +414,44 @@ SNIFFER = {
         "QUIC": {"ports": [443, 8443]},
     },
 }
+
+
+def _load_ruleset():
+    """(providers, rules) from the curated ruleset; ({}, []) when the file is absent."""
+    path = RULESET
+    if not path or not os.path.exists(path):
+        print(f"note: no ruleset at {path} - subscription rules stay in use", file=sys.stderr)
+        return {}, []
+    with open(path, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh) or {}
+    providers = doc.get("rule-providers") or {}
+    rules = doc.get("rules") or []
+    if not isinstance(providers, dict) or not isinstance(rules, list) or not rules:
+        raise SystemExit(f"rejected: ruleset {path} needs rule-providers and rules")
+    return providers, [str(r) for r in rules]
+
+
+def _map_rule(rule: str) -> str:
+    """上游规则的目标组换成本项目的组；MATCH 由调用方统一追加。"""
+    parts = [p.strip() for p in rule.split(",")]
+    keyword = parts[0].upper()
+    if keyword in ("MATCH", "FINAL"):
+        return rule
+    if keyword == "AND":
+        # AND,((DST-PORT,443),(NETWORK,UDP)),REJECT -> 目标在最后一段
+        parts[-1] = TARGET_MAP.get(parts[-1], TARGET_DEFAULT)
+        return ",".join(parts)
+    if len(parts) >= 3:
+        parts[2] = TARGET_MAP.get(parts[2], TARGET_DEFAULT)
+    return ",".join(parts)
+
+
+def _map_rules(rules) -> list:
+    return [
+        _map_rule(rule)
+        for rule in rules
+        if rule.split(",", 1)[0].strip().upper() not in ("MATCH", "FINAL")
+    ]
 
 
 def _score_table() -> dict:
@@ -588,8 +652,26 @@ def main(dst: str, srcs: list) -> None:
         )
         for r in rules
     ]
+    # --- 规则层：curated 规则集在前，订阅规则按开关决定是否保留 ---
+    ruleset_providers, ruleset_rules = _load_ruleset()
+    curated = _map_rules(ruleset_rules)
+    if not SUB_RULES and curated:
+        print(
+            f"note: dropping {len(rules)} subscription rule(s) in favour of the curated ruleset",
+            file=sys.stderr,
+        )
+        rules = []
     rules.append(f"MATCH,{EXIT_GROUP}")
-    cfg["rules"] = list(PINNED_RULES) + rules
+    cfg["rules"] = list(PINNED_RULES) + curated + rules
+    if ruleset_providers:
+        for name, spec in ruleset_providers.items():
+            if isinstance(spec, dict):
+                # 内核按 -d 目录解析相对路径，即 /data/cache/rule-providers/
+                spec.setdefault("path", f"./rule-providers/{name}.mrs")
+                spec.setdefault("proxy", RULESET_PROXY)
+        cfg["rule-providers"] = ruleset_providers
+    else:
+        cfg.pop("rule-providers", None)
 
     # banned regions and pseudo-nodes never reach the node table at all
     cfg["proxies"] = local + [

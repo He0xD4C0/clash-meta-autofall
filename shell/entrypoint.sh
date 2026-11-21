@@ -41,8 +41,22 @@ case "$MODE" in
     mihomo -t -d "$DATA_DIR/cache" -f "$DATA_DIR/artifacts/config.yaml"
     exec python3 "${TOOLS_DIR:-/opt/tools}/validate.py" tree "$DATA_DIR"
     ;;
+  scheduler)
+    # 后台常驻：5 分钟巡检 + 6 小时评分周期
+    exec "$SHELL_DIR/scheduler.sh"
+    ;;
+  watchdog)
+    exec python3 "${TOOLS_DIR:-/opt/tools}/watchdog.py"
+    ;;
+  purity)
+    shift || true
+    exec python3 "${TOOLS_DIR:-/opt/tools}/purity.py" "$@"
+    ;;
+  ui)
+    exec python3 "${TOOLS_DIR:-/opt/tools}/ui.py"
+    ;;
   *)
-    echo "usage: entrypoint.sh {update|loop|score|validate}" >&2
+    echo "usage: entrypoint.sh {update|loop|score|validate|scheduler|watchdog|purity|ui}" >&2
     exit 2
     ;;
 esac

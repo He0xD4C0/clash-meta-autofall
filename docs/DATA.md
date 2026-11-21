@@ -26,7 +26,11 @@
 | `artifacts/scores.json` | shell（评分） | shell（排序）、人 | 0644 | tmp + rename | `scores.schema.json` + 权重和 ≈1 |
 | `artifacts/identity.json` | shell（合并） | shell（评分/排序） | 0644 | tmp + rename | `stable_id` 唯一 |
 | `artifacts/config.yaml` | shell（合并） | core | 0600 | tmp + rename | 内核 `-t`（唯一权威） |
+| `artifacts/purity.json` | shell（纯净度探测） | shell（评分）、ui | 0644 | tmp + rename | 结构校验；过期（>12h）即忽略 |
+| `artifacts/probe-config.yaml` | shell（由主配置派生） | probe-core | 0600 | tmp + rename | 内核 `-t`（global 模式、无规则） |
+| `run.log` | shell（巡检/调度） | ui、人 | 0644 | 追加单行 JSON | 不校验（只读展示） |
 | `artifacts/archive/scores-*.json.gz` | shell | 人 | 0644 | 先写后改名 | 同上（归档前已校验） |
+| `artifacts/archive/purity-*.json.gz` | shell | 人 | 0644 | 先写后改名 | 同上 |
 | `cache/cache.db` | core | core | 0600 | 内核自管 | 不校验 |
 | `last-failure/` | shell（仅在失败时） | 人 | 0700 | 目录整体保留 | 不校验 |
 
@@ -35,7 +39,8 @@
 1. `artifacts/config.yaml` 是**产物**：只有 shell 写，任何手工修改都会被下一次合并覆盖。
 2. 订阅池**顺序有语义**（fallback 的优先顺序），工具不得重排。
 3. 节点显示名**冻结**：改名等于新节点（分数与面板选中记录都会断），改名必须与一次完整重评分同批进行。
-4. `scores.json` 的 `platforms` 权重之和必须为 1.0（±0.01）。
+4. `scores.json` 的 `platforms` 权重之和 + `purity_weight` 必须为 1.0（±0.01）；
+   有纯净度数据时 `purity_weight` 默认 0.10，平台权重按比例让出。
 5. 新鲜度阈值 = 2 × 刷新周期；超过即视为不可用，排序退回订阅顺序。
 6. 密钥类文件（`secrets/`）不得进入任何归档、日志、报错信息。
 
@@ -57,6 +62,8 @@ DATA_DIR/
 | --- | --- | --- | --- | --- | --- | --- |
 | core | — | ro | ro | rw | — | — |
 | shell | ro | ro | rw | — | rw | rw |
+| probe-core | — | — | ro（probe-config） | 自有 `probe/` | — | — |
+| ui | — | — | ro | — | ro | — |
 | panel | — | — | — | — | — | — |
 
 ## 4. 从扁平目录迁移

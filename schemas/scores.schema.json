@@ -27,6 +27,12 @@
         "maximum": 1
       }
     },
+    "purity_weight": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "IP 纯净度维度在总分中的权重；与 platforms 各项权重之和恒为 1.0"
+    },
     "prefer": {
       "type": "array",
       "description": "偏好地区代码列表",
@@ -62,6 +68,22 @@
             "description": "地区代码；无法识别时为 unknown"
           },
           "preferred": {"type": "boolean"},
+          "purity": {
+            "type": "object",
+            "description": "IP 纯净度（来自外部 IP 情报接口）：住宅/移动高、机房低、被判定代理最低",
+            "required": ["score"],
+            "additionalProperties": true,
+            "properties": {
+              "score": {"type": "number", "minimum": 0, "maximum": 100},
+              "ip": {"type": ["string", "null"]},
+              "country_code": {"type": ["string", "null"]},
+              "claimed": {"type": ["string", "null"]},
+              "region_match": {"type": ["boolean", "null"]},
+              "hosting": {"type": ["boolean", "null"]},
+              "proxy": {"type": ["boolean", "null"]},
+              "reason": {"type": ["string", "null"]}
+            }
+          },
           "bonus": {"type": "number", "minimum": 0},
           "platforms": {
             "type": "object",

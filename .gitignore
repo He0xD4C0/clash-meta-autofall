@@ -4,6 +4,9 @@ config.yaml
 subscriptions.yaml
 local-nodes.yaml
 scores.json
+purity.json
+probe-config.yaml
+run.log
 cache.db
 *.tmp
 *.swp
