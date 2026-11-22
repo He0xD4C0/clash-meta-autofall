@@ -1,5 +1,7 @@
 # mihomo-stack
 
+> **此栈已经迁移到[zashboard-autofallback](https://github.com/He0xD4C0/zashboard-autofallback.git)，本项目归档**
+
 一个自托管的 mihomo 运行栈：**core 容器只跑内核**，订阅抓取、配置生成、节点评分与热重载由独立的 **shell 容器**承担，**panel** 提供定制 Zashboard，含节点控制和评分、纯净度、巡检诊断，**probe-core** 是只在测出口 IP 时使用的 global 模式内核。
 
 节点评价由三部分组成：多站点连通性（可用性/延迟/抖动）、IP 纯净度（住宅/机房/被判定代理，含地区虚标校验）、地区偏好加成；结果写进 `artifacts/scores.json` 并决定组内顺序。选中节点由 `tools/watchdog.py` 每 5 分钟巡检，失败即触发组内重选。
