@@ -42,6 +42,7 @@ CONFIG = os.environ.get(
 )
 PROBE_API = os.environ.get("PROBE_API", "http://probe-core:9090").rstrip("/")
 PROBE_PROXY = os.environ.get("PROBE_PROXY", "http://probe-core:7899")
+PURITY_MISSING = float(os.environ.get("MIHOMO_PURITY_MISSING", "40"))
 
 FIELDS = "status,message,country,countryCode,regionName,city,as,asname,hosting,proxy,mobile"
 
@@ -205,8 +206,8 @@ def classify(ip, timeout, pace_state) -> dict:
                 "city": doc.get("city"),
                 "asn": doc.get("as"),
                 "asname": doc.get("asname") or doc.get("as"),
-                "hosting": bool(doc.get("hosting")),
-                "proxy": bool(doc.get("proxy")),
+                "hosting": doc.get("hosting"),
+                "proxy": doc.get("proxy"),
                 "mobile": bool(doc.get("mobile")),
                 "source": "ip-api",
             }
@@ -240,6 +241,8 @@ def score_of(info: dict, claimed: str):
         base, reason = 20.0, "flagged-proxy"
     elif info.get("hosting"):
         base, reason = 55.0, "datacenter"
+    elif info.get("proxy") is None or info.get("hosting") is None:
+        base, reason = PURITY_MISSING, "unclassified"
     else:
         base, reason = 100.0, "residential"
     expected = REGION_COUNTRY.get(claimed)
@@ -296,23 +299,26 @@ def main(argv) -> int:
         except Exception as exc:
             # 属性查不到但 IP 是真的：按"未知"处理，给中间分而不是 0
             info = {
-                "country": None, "country_code": found.get("country_code") or None,
-                "asn": None, "asname": None, "hosting": False, "proxy": False,
-                "mobile": False, "source": "none", "classify_error": str(exc)[:80],
+                "country": None, "asn": None, "asname": None,
+                "hosting": None, "proxy": None, "mobile": None,
+                "classify_error": str(exc)[:80],
             }
+        country_code = info.get("country_code") or found.get("country_code") or None
+        info["country_code"] = country_code
         purity, reason = score_of(info, claimed)
         expected = REGION_COUNTRY.get(claimed)
         result[node] = {
             **info,
             **found,
+            "country_code": country_code,
             "claimed": claimed,
-            "region_match": bool(expected and expected == info.get("country_code")),
+            "region_match": expected == country_code if expected and country_code else None,
             "purity": purity,
             "reason": reason,
             "latency_ms": round((time.time() - started) * 1000, 1),
         }
         print(
-            f"  [{index}/{len(pool)}] {node}: {found['ip']} {info.get('country_code')}"
+            f"  [{index}/{len(pool)}] {node}: {found['ip']} {country_code}"
             f" {info.get('asname') or '?'} purity={purity:.0f} ({reason})",
             flush=True,
         )

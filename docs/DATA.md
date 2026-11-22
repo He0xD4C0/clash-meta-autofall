@@ -26,9 +26,9 @@
 | `artifacts/scores.json` | shell（评分） | shell（排序）、人 | 0644 | tmp + rename | `scores.schema.json` + 权重和 ≈1 |
 | `artifacts/identity.json` | shell（合并） | shell（评分/排序） | 0644 | tmp + rename | `stable_id` 唯一 |
 | `artifacts/config.yaml` | shell（合并） | core | 0600 | tmp + rename | 内核 `-t`（唯一权威） |
-| `artifacts/purity.json` | shell（纯净度探测） | shell（评分）、ui | 0644 | tmp + rename | 结构校验；过期（>12h）即忽略 |
+| `artifacts/purity.json` | shell（纯净度探测） | shell（评分） | 0644 | tmp + rename | 结构校验；过期（>12h）即忽略 |
 | `artifacts/probe-config.yaml` | shell（由主配置派生） | probe-core | 0600 | tmp + rename | 内核 `-t`（global 模式、无规则） |
-| `run.log` | shell（巡检/调度） | ui、人 | 0644 | 追加单行 JSON | 不校验（只读展示） |
+| `run.log` | shell（巡检/调度） | shell（诊断快照）、人 | 0644 | 追加单行 JSON | 不校验（只读展示） |
 | `artifacts/archive/scores-*.json.gz` | shell | 人 | 0644 | 先写后改名 | 同上（归档前已校验） |
 | `artifacts/archive/purity-*.json.gz` | shell | 人 | 0644 | 先写后改名 | 同上 |
 | `cache/cache.db` | core | core | 0600 | 内核自管 | 不校验 |
@@ -56,14 +56,16 @@ DATA_DIR/
 └── last-failure/  失败现场 rw  ◄──────► shell
 ```
 
-挂载矩阵（路线 B 落地后）：
+面板单独挂载诊断卷，只读 `/diagnostics/state.json`。订阅缓存存放于 `subscription-cache/`，目录权限为 0700，文件权限为 0600。
+
+挂载矩阵（数据卷）：
 
 | 容器 | secrets | assets | artifacts | cache | archive | last-failure |
 | --- | --- | --- | --- | --- | --- | --- |
 | core | — | ro | ro | rw | — | — |
 | shell | ro | ro | rw | — | rw | rw |
 | probe-core | — | — | ro（probe-config） | 自有 `probe/` | — | — |
-| ui | — | — | ro | — | ro | — |
+| panel | — | — | — | — | — | — |
 | panel | — | — | — | — | — | — |
 
 ## 4. 从扁平目录迁移

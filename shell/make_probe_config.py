@@ -11,6 +11,7 @@ global 模式下正好提供这个能力：切换 GLOBAL 选中项，再经它�
 import argparse
 import os
 import sys
+import tempfile
 
 import yaml
 
@@ -53,10 +54,16 @@ def main(argv) -> int:
         source = yaml.safe_load(fh) or {}
     doc = build(source, args.mixed_port, args.secret, args.api)
 
-    tmp = f"{args.dst}.tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        yaml.safe_dump(doc, fh, allow_unicode=True, sort_keys=False)
-    os.replace(tmp, args.dst)
+    fd, tmp = tempfile.mkstemp(
+        dir=os.path.dirname(args.dst) or ".", prefix=f".{os.path.basename(args.dst)}."
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(doc, fh, allow_unicode=True, sort_keys=False)
+        os.replace(tmp, args.dst)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     print(f"written {args.dst} ({len(doc['proxies'])} nodes)")
     return 0
 

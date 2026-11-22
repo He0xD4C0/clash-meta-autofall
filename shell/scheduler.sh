@@ -18,6 +18,9 @@ watchdog_loop() {
   sleep "${WATCHDOG_WARMUP:-30}"
   while :; do
     "$PY" "$TOOLS_DIR/watchdog.py" 2>&1 | sed 's/^/  /' || log "watchdog failed"
+    if [ -n "${DIAGNOSTICS_DIR:-}" ]; then
+      "$PY" "$TOOLS_DIR/diagnostics.py" || log "diagnostics publication failed"
+    fi
     sleep "$WATCHDOG_INTERVAL"
   done
 }

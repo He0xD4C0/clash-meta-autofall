@@ -19,27 +19,22 @@
 ## 2. 服务拓扑
 
 ```
- panel :19091 ──(浏览器直连 API)──┐        ui :19093 ──(读快照 + API)──┐
-                                  ▼                                  ▼
-                             core :19090 (API) / :17897 (mixed，仅 loopback 发布)
-                                  ▲                                  ▲
-                         shell（唯一写方：拉订阅/合并/纯净度/评分/巡检/热重载）
-                                  │
-                     probe-core :19092（global 模式，逐节点测出口 IP）
-                                  │
-                       卷 mihomo-stack-data:/data
+panel :19091 ──┬──► core :9090 (同源 /mihomo-api)
+               └──► diagnostics:/diagnostics (只读快照)
+shell ────────► core :9090 / probe-core :9090 (刷新、巡检、热重载)
+shell ────────► diagnostics:/diagnostics (写)
+core ─────────► 127.0.0.1:17897 (宿主 mixed 端口)
 ```
 
 * **core** 只跑内核：`-d /data/cache -f /data/artifacts/config.yaml`，只读根文件系统。
 * **shell** 只跑运行时（alpine + python3 + pyyaml + curl + 内核二进制），业务脚本以只读卷
   `./shell:/opt/shell` 注入，**改策略不重建镜像**。
 * 规则层以只读卷 `./rules:/opt/rules` 注入（`MIHOMO_RULESET=/opt/rules/henrychiao.yaml`）；
-  `MIHOMO_SUB_RULES=0` 表示只用 curated 规则，`MIHOMO_RULESET_PROXY` 控制 `.mrs` 的下载路径（默认 DIRECT）。
-* **panel** 用上游面板镜像，无服务端出网需求，端口只发布到 loopback。
+  `MIHOMO_SUB_RULES=0` 表示只用 curated 规则。Shell 下载并校验规则包，支持容器的 HTTP(S) 代理环境，失败后直连重试。
+* **panel** 用固定提交构建的定制 Zashboard，端口只发布到 loopback。生产反代应限制面板和 API 的访问范围。
 * **probe-core** 与 core 同镜像，但 `mode: global`、无规则、DNS 关闭；配置由
   `shell/make_probe_config.py` 从主配置派生，节点表变化后由 `tools/reload.py` payload 热重载。
   它的混合端口必须 `allow-lan: true`（shell 容器在别的网段），API 只发布到 loopback。
-* **ui** 与 shell 同镜像、只读根文件系统，只读 `artifacts/` 与 `run.log`，无写权限。
 * 周期任务（`scheduler`）并进 shell 容器：两个独立循环，间隔来自
   `WATCHDOG_INTERVAL`（默认 300s）与 `REFRESH_INTERVAL`（默认 21600s）。
 
@@ -54,7 +49,7 @@
 /data/probe/         probe-core 的 -d 目录（cache.db）
 /data/cache/         内核的 -d 目录：cache.db 与 geo 副本
 /data/archive/       评分/纯净度归档（各最多 7 份）
-/data/run.log        巡检与调度日志（单行 JSON，ui 读取）
+/data/run.log        巡检与调度日志（单行 JSON，shell 提取诊断摘要）
 /data/last-failure/  失败现场（KEEP_FAILURE=1 时）
 ```
 
@@ -75,7 +70,7 @@
 shell 镜像升级：改 `shell/Dockerfile` 或镜像 tag → `docker compose build shell && docker compose up -d shell`。
 脚本类改动（merge/score/update 逻辑）不需要重建镜像，改完 `docker compose restart shell` 即可。
 
-面板升级：`docker compose pull panel && docker compose up -d panel`。
+面板升级：更新 Compose 中的 fork 提交后，运行 `docker compose build panel && docker compose up -d --remove-orphans panel`。
 
 原则：**镜像版本与数据卷解耦**。升级只替换容器，`/data` 始终复用；失败时回退到旧镜像 tag 即可，不需要配置回滚。
 
@@ -94,7 +89,7 @@ shell 镜像升级：改 `shell/Dockerfile` 或镜像 tag → `docker compose bu
 ## 6. 已知限制（开发栈）
 
 * 没有透明代理与出口容器：`MIHOMO_TPROXY_PORT` 留空，生成的配置不含 `tproxy-port`。
-* 没有 TLS 与反代：面板直接访问 `127.0.0.1:19091`，后端指向 `http://127.0.0.1:19090`（内核已开 CORS）。
+* 没有 TLS 与反代：面板直接访问 `127.0.0.1:19091`，后端指向 `http://127.0.0.1:19090`；诊断请使用面板同源的 `/mihomo-api` 后端。
 * 离线播种的节点全部不可达：评分会得到 0 分，这是预期行为，用来验证"全 0 时排序退回订阅顺序"。
 
 ## 6.1 实测踩到的四个约束（已写进实现）
@@ -103,7 +98,7 @@ shell 镜像升级：改 `shell/Dockerfile` 或镜像 tag → `docker compose bu
    且 `SAFE_PATHS` 环境变量在本版本未生效），改成 `PUT /configs {"payload": <yaml>}` 后 204 成功。
    因为 payload 就是刚安装的文件内容，内存与磁盘不会分叉。
 2. **首次启动顺序**：core 在配置尚不存在时会以内置默认配置启动（API 绑在 loopback，shell 连不上）。
-   正确顺序是 `seed_dev.sh` → `shell update`（可一次性 `run --rm`）→ `up -d`；若已颠倒，`compose restart core` 即可。
+   执行 `seed_dev.sh` 后用 `docker compose up -d --build`，让 `init` 先验证配置和规则。
 3. **panel 镜像需要可写 `/data` 与 `/config`**（内部用 caddy 起静态站点），强制只读会 `exec ... operation not permitted`。
    面板不持有密钥（后端地址与 secret 存浏览器），故保留上游默认权限，仅加 `no-new-privileges`。
 4. **评分只跑平台子集时必须重新归一权重**，否则 `scores.json` 的权重和不再等于 1.0、契约校验会失败。
@@ -111,7 +106,7 @@ shell 镜像升级：改 `shell/Dockerfile` 或镜像 tag → `docker compose bu
 5. **首次启动必须先把配置落盘再起内核**：内核在配置缺失时不会报错，而是自己写一个 16 字节的默认 stub
    （`mixed-port: 7890`）并绑 loopback 运行，导致 shell 既连不上 API 也没法热重载。现在由一次性
    `init` 服务（`command: ["init"]`）在 core 之前完成"合并 + 校验 + 落盘"，core 用
-   `depends_on: init: condition: service_completed_successfully` 等它。
+   `depends_on: init: condition: service_completed_successfully` 等它。重建时直接校验已安装的配置与本地规则。
    "磁盘上有没有我们装的配置"用标记文件 `artifacts/.config-installed` 判断，不能用文件是否存在/大小
    （stub 也是文件）。
 6. **`COPY --from` 引用的 ARG 必须在目标 stage 内重新声明**，否则会展开成空串并把目录当成文件复制过来；

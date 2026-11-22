@@ -4,8 +4,15 @@
 """
 
 import importlib.util
+import io
+import json
 import os
+import sys
+import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -53,6 +60,37 @@ class SitePlatformTests(unittest.TestCase):
         os.environ["MIHOMO_SITE_HEALTH_URL"] = "https://panel.example.com/"
         self.assertIn("site", load("score_with_site").PLATFORMS)
         os.environ.pop("MIHOMO_SITE_HEALTH_URL", None)
+
+
+class PurityWeightTests(unittest.TestCase):
+    def test_scoring_uses_the_published_weights(self):
+        score = load("score_weights")
+        cases = (
+            ("gstatic", {"node": {"purity": 0.0}}, 0.10, 90.0),
+            ("gstatic,ai", {"node": {"purity": 0.0}}, 0.10, 90.0),
+            ("all", {"node": {"purity": 0.0}}, 0.10, 90.0),
+            ("gstatic", {}, 0.0, 100.0),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "scores.json"
+            for platforms, purity, weight, overall in cases:
+                args = ["score.py", "--platforms", platforms, "--json", str(output)]
+                with self.subTest(platforms=platforms, purity=purity):
+                    with (
+                        patch.object(sys, "argv", args),
+                        patch.multiple(
+                            score, PURITY_WEIGHT=0.10, _secret=lambda: "test",
+                            nodes=lambda _: ["node"], probe=lambda *_: 50.0,
+                            load_purity=lambda: purity,
+                        ),
+                        redirect_stdout(io.StringIO()),
+                        redirect_stderr(io.StringIO()),
+                    ):
+                        self.assertEqual(score.main(), 0)
+                    data = json.loads(output.read_text())
+                    self.assertEqual(data["purity_weight"], weight)
+                    self.assertAlmostEqual(sum(data["platforms"].values()) + weight, 1.0, places=5)
+                    self.assertEqual(data["nodes"]["node"]["overall"], overall)
 
 
 if __name__ == "__main__":

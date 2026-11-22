@@ -19,12 +19,12 @@
 
 映射表是本项目的一处策略决定，改它等于改流量归属，改动前先看一遍 `docs/DECISIONS.md` 里 U3 的记录。
 
-## 43 个规则集文件（.mrs）怎么来
+## 规则集文件
 
-* 上游是 `type: http` + `format: mrs` + `interval: 86400` 的远程规则集，指向 `github.com/666OS/rules` 等源。
-* 本项目不改这些 URL，只给每个 provider 补一个本地缓存路径：`./rule-providers/<Name>.mrs`（相对于内核的 `-d` 目录，即 `/data/cache/rule-providers/`）。
-* 首次拉取由内核完成；拉取失败时内核沿用上次缓存，规则集缺失只会让对应 `RULE-SET` 规则落空并继续往下匹配。
-* 实测：本机直连 `raw.githubusercontent.com` 可用（200），因此 provider 不强制走代理；若某个环境直连不通，可在 merge.py 里给 provider 加 `proxy: 出口`。
+* 对实际被配置引用的规则，shell 下载并在独立内核中校验，随后以本地文件形式交给业务内核。
+* GitHub 的仓库 `/raw/` 路径按同一提交或分支直连 `raw.githubusercontent.com`。GitHub 专用规则采用 [blackmatrix7 的 Clash GitHub 规则](https://github.com/blackmatrix7/ios_rule_script/tree/master/rule/Clash/GitHub)，保留原策略组映射。
+* UK WiFi 规则使用原仓库迁移后的 [UK-wifi-call.list](https://github.com/HenryChiao/wificalling/blob/main/rules/UK-wifi-call.list)。
+* 启动和刷新复用完整的已验证规则包。新规则下载或校验失败时继续使用原版本。检查运行时各规则是否加载可用 `docker compose run --rm shell validate`。
 
 ## 更新步骤
 

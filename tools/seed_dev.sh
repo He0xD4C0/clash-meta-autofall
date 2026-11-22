@@ -24,7 +24,7 @@ MOUNTS=(-v "$VOLUME:/data" -v "$ROOT/tests/fixtures:/fixtures:ro")
 [ -d "$GEO_SRC" ] && MOUNTS+=(-v "$GEO_SRC:/geo:ro")
 [ -n "$SUBS_SRC" ] && [ -f "$SUBS_SRC" ] && MOUNTS+=(-v "$SUBS_SRC:/subs.yaml:ro")
 
-docker run --rm "${MOUNTS[@]}" alpine:3.20 sh -c '
+docker run --rm "${MOUNTS[@]}" alpine:3.24 sh -c '
 set -eu
 mkdir -p /data/secrets /data/assets /data/artifacts /data/cache /data/archive
 if [ -f /geo/geoip.metadb ] && [ -f /geo/geosite.dat ]; then

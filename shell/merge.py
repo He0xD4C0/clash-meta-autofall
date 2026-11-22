@@ -52,6 +52,7 @@ the GUI/panel can only change what is declared here:
 """
 
 import copy
+import ipaddress
 import json
 import os
 import re
@@ -420,6 +421,8 @@ def _load_ruleset():
     """(providers, rules) from the curated ruleset; ({}, []) when the file is absent."""
     path = RULESET
     if not path or not os.path.exists(path):
+        if path and os.environ.get("MIHOMO_RULESET"):
+            raise SystemExit(f"rejected: configured ruleset is missing: {path}")
         print(f"note: no ruleset at {path} - subscription rules stay in use", file=sys.stderr)
         return {}, []
     with open(path, encoding="utf-8") as fh:
@@ -495,6 +498,35 @@ def _rank(nodes: list, scores: dict, platform=None) -> list:
     return sorted(nodes, key=key)
 
 
+def configure_inbound(cfg):
+    cfg["mixed-port"] = MIXED_PORT
+    cfg["allow-lan"] = True
+    cfg["bind-address"] = "*"
+    cidrs = os.environ.get("MIHOMO_LAN_ALLOWED_IPS", "127.0.0.0/8,10.0.0.0/8")
+    cfg["lan-allowed-ips"] = [str(ipaddress.ip_network(cidr.strip())) for cidr in cidrs.split(",")]
+    cfg["external-controller"] = API_LISTEN
+    cfg["external-doh-server"] = "/dns-query"
+    if not API_SECRET:
+        raise SystemExit("rejected: MIHOMO_SECRET is empty - the API would be unauthenticated")
+    cfg["secret"] = API_SECRET
+    cfg["external-controller-cors"] = {"allow-origins": ["*"], "allow-private-network": True}
+    if TPROXY_PORT:
+        cfg["tproxy-port"] = int(TPROXY_PORT)
+    else:
+        cfg.pop("tproxy-port", None)
+
+
+def restore(path):
+    with open(path, encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh)
+    if not isinstance(cfg, dict) or not cfg.get("proxies"):
+        raise SystemExit("installed configuration has no nodes")
+    configure_inbound(cfg)
+    _assert_policy(cfg)
+    with open(path, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(cfg, fh, allow_unicode=True, sort_keys=False)
+
+
 def main(dst: str, srcs: list) -> None:
     docs = []
     for path in srcs:
@@ -528,28 +560,10 @@ def main(dst: str, srcs: list) -> None:
     ):
         cfg.pop(key, None)
 
-    cfg["mixed-port"] = MIXED_PORT
-    cfg["allow-lan"] = True
-    cfg["bind-address"] = "*"
-    cfg["lan-allowed-ips"] = ["127.0.0.0/8", "10.0.0.0/8"]
-    # Loopback only: nginx terminates TLS on 443 and proxies /dns-query here.
-    # The DoH handler is mounted outside the secret-authenticated group, so it
-    # must never be reachable from anything but the local nginx.
-    cfg["external-controller"] = API_LISTEN
-    cfg["external-doh-server"] = "/dns-query"
-    if not API_SECRET:
-        raise SystemExit("rejected: MIHOMO_SECRET is empty - the API would be unauthenticated")
-    cfg["secret"] = API_SECRET
-    cfg["external-controller-cors"] = {
-        "allow-origins": ["*"],
-        "allow-private-network": True,
-    }
+    configure_inbound(cfg)
     cfg["ipv6"] = False
     cfg["geo-auto-update"] = False
     cfg["profile"] = {"store-selected": True, "store-fake-ip": True}
-    cfg["tproxy-port"] = int(TPROXY_PORT) if TPROXY_PORT else None
-    if cfg["tproxy-port"] is None:
-        cfg.pop("tproxy-port")
     cfg["sniffer"] = copy.deepcopy(SNIFFER)
     cfg["dns"] = copy.deepcopy(DNS_OVERRIDE)
 
@@ -689,6 +703,9 @@ def main(dst: str, srcs: list) -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--restore":
+        restore(sys.argv[2])
+        sys.exit(0)
     if len(sys.argv) < 3:
         raise SystemExit(
             f"usage: {sys.argv[0]} <output.yaml> <subscription.yaml> [more.yaml ...]"

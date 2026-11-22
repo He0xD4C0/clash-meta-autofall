@@ -11,6 +11,7 @@ name: mihomo-stack
 # shell 与 init 共用同一份挂载与环境，避免两处漂移
 x-shell-volumes: &shell-volumes
   - data:/data
+  - diagnostics:/diagnostics
   - ./shell:/opt/shell:ro
   - ./tools:/opt/tools:ro
   - ./schemas:/opt/schemas:ro
@@ -30,6 +31,9 @@ x-shell-env: &shell-env
   # 开发栈没有出口容器：留空 -> 不生成 tproxy-port
   - MIHOMO_TPROXY_PORT=
   - MIHOMO_MIXED_PORT=7897
+  - MIHOMO_LAN_ALLOWED_IPS=${MIHOMO_LAN_ALLOWED_IPS:-127.0.0.0/8,${MIHOMO_BRIDGE_GATEWAY:-172.30.197.1}/32}
+  - SUBSCRIPTION_CACHE_MAX_AGE=${SUBSCRIPTION_CACHE_MAX_AGE:-86400}
+  - DIAGNOSTICS_DIR=/diagnostics
   - PREFER_REGION=${PREFER_REGION:-jp}
   - SCORE_PLATFORMS=${SCORE_PLATFORMS:-all}
   - SCORE_SAMPLES=${SCORE_SAMPLES:-2}
@@ -40,13 +44,12 @@ x-shell-env: &shell-env
   - MIHOMO_SITE_GROUP=${MIHOMO_SITE_GROUP:-Site出口}
   - MIHOMO_SITE_DOMAINS=${MIHOMO_SITE_DOMAINS:-}
   - MIHOMO_SITE_HEALTH_URL=${MIHOMO_SITE_HEALTH_URL:-}
+  - MIHOMO_SITE_HEALTH_STATUS=${MIHOMO_SITE_HEALTH_STATUS:-200}
   - MIHOMO_LOCAL_NODES=/data/secrets/local-nodes.yaml
   # curated 规则层（rules/henrychiao.yaml）；SUB_RULES=0 表示丢弃订阅自带规则
   - MIHOMO_RULESET=/opt/rules/henrychiao.yaml
   - MIHOMO_SUB_RULES=${MIHOMO_SUB_RULES:-0}
-  # 规则集下载路径：DIRECT（默认，直连 github）或某个组名（如 出口）
-  - MIHOMO_RULESET_PROXY=${MIHOMO_RULESET_PROXY:-DIRECT}
-  # 评分快照：merge/score/ui 三处共用，显式给值，避免落到脚本目录
+  # 评分快照供生成配置、评分和诊断导出共用
   - MIHOMO_SCORES=/data/artifacts/scores.json
   # 探测内核（按节点发请求、测真实出口 IP）
   - PROBE_API=http://probe-core:9090
@@ -58,7 +61,6 @@ x-shell-env: &shell-env
   - PURITY_ENABLED=${PURITY_ENABLED:-1}
   - PURITY_PACE=${PURITY_PACE:-1.5}
   - MIHOMO_PURITY_WEIGHT=${MIHOMO_PURITY_WEIGHT:-0.10}
-  - UI_PORT=8080
   - KEEP_FAILURE=${KEEP_FAILURE:-0}
 
 services:
@@ -115,6 +117,11 @@ services:
     command: ["scheduler"]
     depends_on:
       - core
+    healthcheck:
+      test: ["CMD", "python3", "/opt/tools/rules.py", "live", "/data/artifacts/config.yaml"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     logging:
       driver: json-file
       options:
@@ -174,7 +181,9 @@ services:
         max-file: "2"
 
   panel:
-    image: ghcr.io/zephyruso/zashboard:latest
+    build:
+      context: ${ZASHBOARD_CONTEXT:-https://github.com/He0xD4C0/zashboard-autofallback.git#30f5c2861cea13bf97c03b88813b09736eb19f35}
+    image: ${ZASHBOARD_IMAGE:-mihomo-stack-panel:local}
     container_name: mihomo-stack-panel
     restart: unless-stopped
     # 上游镜像用 caddy 起静态站点，写 /data 与 /config；固定只读会直接起不来。
@@ -185,6 +194,8 @@ services:
       - /data
       - /config
       - /tmp
+    volumes:
+      - diagnostics:/diagnostics:ro
     ports:
       - "127.0.0.1:${DEV_PANEL_PORT:-19091}:80"
     healthcheck:
@@ -198,35 +209,13 @@ services:
         max-size: "5m"
         max-file: "2"
 
-  # 自建状态面板：评分 / 纯净度 / 当前选路 / 巡检日志
-  ui:
-    build:
-      context: ./shell
-      args:
-        CORE_IMAGE: ${CORE_IMAGE:-metacubex/mihomo:v1.19.33}
-        CORE_BIN: ${CORE_BIN:-/mihomo}
-    image: mihomo-stack-shell:0.1
-    container_name: mihomo-stack-ui
-    restart: unless-stopped
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    volumes: *shell-volumes
-    environment: *shell-env
-    command: ["ui"]
-    depends_on:
-      - core
-    ports:
-      - "127.0.0.1:${DEV_UI_PORT:-19093}:8080"
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "2"
-
 volumes:
   data:
+  diagnostics:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${MIHOMO_BRIDGE_SUBNET:-172.30.197.0/24}
+          gateway: ${MIHOMO_BRIDGE_GATEWAY:-172.30.197.1}

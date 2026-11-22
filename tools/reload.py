@@ -21,6 +21,7 @@ def reload(api: str, secret: str, path: str, retries: int, delay: float) -> int:
     api = api.rstrip("/")
     with open(path, encoding="utf-8") as fh:
         body = json.dumps({"payload": fh.read()}).encode()
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     last = None
     for _ in range(retries):
         req = urllib.request.Request(
@@ -30,11 +31,16 @@ def reload(api: str, secret: str, path: str, retries: int, delay: float) -> int:
             headers={"Authorization": "Bearer " + secret, "Content-Type": "application/json"},
         )
         try:
-            urllib.request.urlopen(req, timeout=60).read()
+            with opener.open(req, timeout=60):
+                pass
             return 0
-        except Exception as exc:
+        except urllib.error.HTTPError as exc:
             last = exc
-            time.sleep(delay)
+            if 400 <= exc.code < 500:
+                break
+        except OSError as exc:
+            last = exc
+        time.sleep(delay)
     print(f"reload rejected: {last}", file=sys.stderr)
     return 1
 

@@ -10,8 +10,8 @@ against a set of commonly blocked platforms and turns them into 0-100 scores:
     latency       中位 RTT，300ms 满分、2000ms 归零    weight 0.35
     stability     1 - 标准差/中位（抖动惩罚）          weight 0.15
 
-Per node: overall = Σ platform_weight × platform_score (0-100). A preferred
-region then gets a small bonus (`--prefer`, default 日本) so an equally good
+Per node: overall is the weighted sum of platform scores and, when available,
+IP purity (0-100). A preferred region adds a small bonus (`--prefer`, default 日本) so an equally good
 domestic-side exit wins a tie without overriding quality. `final` is that
 ranking index and may exceed 100 - it is a sort key, not a percentage.
 
@@ -35,7 +35,6 @@ import os
 import statistics
 import sys
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -68,6 +67,9 @@ PLATFORMS = {
 SITE_PROBE_URL = os.environ.get("MIHOMO_SITE_HEALTH_URL", "").strip()
 if SITE_PROBE_URL:
     PLATFORMS["site"] = (SITE_PROBE_URL, 0.04)
+
+EXPECTED_STATUS = {"gstatic": "204", "google": "204", "ai": "200",
+                   "site": os.environ.get("MIHOMO_SITE_HEALTH_STATUS", "200")}
 
 # IP 纯净度（tools/purity.py 产出）：住宅/移动 100、机房 55、被判定代理 20，
 # 地区虚标再扣 25。它作为一个独立维度参与总分，权重默认 0.10，其余平台按比例让出。
@@ -135,13 +137,15 @@ def region_of(name: str) -> str:
     return "unknown"
 
 
-def probe(name: str, url: str, timeout_ms: int, secret: str):
+def probe(name: str, url: str, timeout_ms: int, secret: str, expected: str = "200-399"):
     """One real HTTPS request through the node; returns milliseconds or None."""
-    query = urllib.parse.urlencode({"timeout": timeout_ms, "url": url})
-    path = "/proxies/" + urllib.parse.quote(name, safe="") + "/delay?" + query
+    query = urllib.parse.urlencode({"timeout": timeout_ms, "url": url, "expected": expected})
+    path = "/proxies/" + urllib.parse.quote(name, safe="")
     try:
-        return float(_api(path, timeout_ms / 1000 + 10, secret)["delay"])
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError, KeyError):
+        delay = float(_api(path + "/delay?" + query, timeout_ms / 1000 + 10, secret)["delay"])
+        status = (_api(path, 10, secret).get("extra") or {}).get(url, {})
+        return delay if delay > 0 and status.get("alive") is True else None
+    except (OSError, TypeError, ValueError, KeyError):
         return None
 
 
@@ -246,7 +250,7 @@ def main() -> int:
     if args.platforms.strip().lower() == "all":
         chosen = list(PLATFORMS)
     else:
-        chosen = [p.strip() for p in args.platforms.split(",") if p.strip()]
+        chosen = list(dict.fromkeys(p.strip() for p in args.platforms.split(",") if p.strip()))
         unknown = [p for p in chosen if p not in PLATFORMS]
         if unknown:
             print(f"unknown platform(s): {', '.join(unknown)}", file=sys.stderr)
@@ -265,7 +269,8 @@ def main() -> int:
     def worker(task):
         name, platform = task
         url = PLATFORMS[platform][0]
-        return task, [probe(name, url, args.timeout, secret) for _ in range(args.samples)]
+        expected = EXPECTED_STATUS.get(platform, "200-399")
+        return task, [probe(name, url, args.timeout, secret, expected) for _ in range(args.samples)]
 
     tasks = [(n, p) for n in pool for p in chosen]
     raw = {}
@@ -276,6 +281,9 @@ def main() -> int:
     weight_sum = sum(PLATFORMS[p][1] for p in chosen)
     purity_table = load_purity()
     purity_weight = PURITY_WEIGHT if purity_table else 0.0
+    platform_weights = {
+        p: PLATFORMS[p][1] / weight_sum * (1.0 - purity_weight) for p in chosen
+    }
     if purity_table:
         print(
             f"note: purity data for {len(purity_table)} node(s), weight={purity_weight:g}",
@@ -283,15 +291,11 @@ def main() -> int:
         )
     result = {}
     for name, per_platform in raw.items():
-        platform_part = sum(per_platform[p]["score"] * PLATFORMS[p][1] for p in chosen)
+        overall = sum(per_platform[p]["score"] * platform_weights[p] for p in chosen)
         purity = purity_table.get(name)
         if purity_weight:
             purity_score = purity["purity"] if purity is not None else PURITY_MISSING
-            overall = (platform_part + purity_weight * purity_score) / (
-                weight_sum + purity_weight
-            )
-        else:
-            overall = platform_part / weight_sum
+            overall += purity_weight * purity_score
         region = region_of(name)
         bonus = args.prefer_bonus if region in prefer else 0.0
         entry = {
@@ -336,16 +340,13 @@ def main() -> int:
         f" prefer={','.join(prefer) or '-'} (+{args.prefer_bonus:g}), {stamp}"
     )
 
-    platform_share = 1.0 - purity_weight
     write_json_atomic(
         args.json,
         {
             "generated": stamp,
             "samples": args.samples,
             # 平台权重与 purity_weight 之和恒为 1.0（契约要求），子集运行时按子集归一
-            "platforms": {
-                p: round(PLATFORMS[p][1] / weight_sum * platform_share, 6) for p in chosen
-            },
+            "platforms": {p: round(weight, 6) for p, weight in platform_weights.items()},
             "purity_weight": round(purity_weight, 6),
             "prefer": list(prefer),
             "prefer_bonus": args.prefer_bonus,

@@ -14,6 +14,7 @@ set -euo pipefail
 
 DATA_DIR=${DATA_DIR:-/data}
 SHELL_DIR=${SHELL_DIR:-/opt/shell}
+TOOLS_DIR=${TOOLS_DIR:-/opt/tools}
 PY=${PY:-python3}
 API=${MIHOMO_API:-http://127.0.0.1:9090}
 API=${API%/}
@@ -30,7 +31,7 @@ PREFER_REGION=${PREFER_REGION:-jp}
 PREFER_BONUS=${PREFER_BONUS:-5}
 
 log() { printf '%s\n' "  $*"; }
-fail() { printf 'failed: %s\n' "$*" >&2; exit 1; }
+fail() { printf 'failed: %s\n' "$*" >&2; FAILED=1; exit 1; }
 
 # 单写者：定时循环与手动触发同时进来时，后者立刻让位而不是交错。
 exec 9>"$LOCK"
@@ -39,11 +40,17 @@ flock -n 9 || { log "another update is running, skipped"; exit 0; }
 mkdir -p "$ARTIFACTS" "$CACHE" "$DATA_DIR/archive" "$CACHE/rule-providers"
 TMP=$(mktemp -d "$ARTIFACTS/.tmp.XXXXXX")
 cleanup() {
+  local status=$?
+  if [ -n "${DIAGNOSTICS_DIR:-}" ]; then
+    local refresh=ok
+    if [ "$status" != "0" ]; then refresh=failed; elif [ "${DEGRADED:-0}" = "1" ]; then refresh=degraded; fi
+    "$PY" "$TOOLS_DIR/diagnostics.py" "$refresh" || log "diagnostics publication failed"
+  fi
   if [ -d "$TMP" ]; then
     if [ "$KEEP_FAILURE" = "1" ] && [ -n "${FAILED:-}" ]; then
       dest=$DATA_DIR/last-failure/$(date +%Y%m%dT%H%M%S)
       mkdir -p "$dest"
-      cp -a "$TMP"/. "$dest"/ 2>/dev/null || true
+      printf "%s\n" "refresh failed" >"$dest/status"
       log "failure kept in $dest"
     fi
     rm -rf "$TMP"
@@ -54,75 +61,41 @@ trap cleanup EXIT
 on_error() { FAILED=1; }
 trap on_error ERR
 
-[ -f "$SECRETS" ] || fail "no subscription pool at $SECRETS"
-[ -n "${MIHOMO_SECRET:-}" ] || fail "MIHOMO_SECRET is empty"
+SECRET=${MIHOMO_SECRET:-}
+[ -n "$SECRET" ] || fail "MIHOMO_SECRET is empty"
+export MIHOMO_CONFIG=$CONFIG MIHOMO_SECRET=$SECRET MIHOMO_API=$API MIHOMO_SCORES=$SCORES
 
-# 1) 订阅池 -> TSV（标签与地址），顺序即优先级
-"$PY" - "$SECRETS" <<'PY' >"$TMP/pool.tsv"
-import re, sys, yaml
-doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
-entries = doc.get("subscriptions") if isinstance(doc, dict) else None
-if not entries:
-    raise SystemExit("rejected: pool declares no subscription")
-for index, entry in enumerate(entries, 1):
-    url = str(entry.get("url") or "").strip()
-    if not url:
-        continue
-    name = re.sub(r"[^\w.\-]+", "_", str(entry.get("name") or f"sub{index}"))
-    print(f"{name}\t{url}")
-PY
-
-# 2) 逐个下载；先走环境里配置的代理，失败再直连（容器内直连=宿主出口）
-SOURCES=()
-while IFS=$'\t' read -r name url; do
-  [ -n "$url" ] || continue
-  if curl -fsS -m 60 -A 'clash-verge/v2.0.0' "$url" -o "$TMP/$name.yaml"; then
-    log "fetched $name"
-  elif curl -fsS --noproxy '*' -m 60 -A 'clash-verge/v2.0.0' "$url" -o "$TMP/$name.yaml"; then
-    log "fetched $name (direct)"
-  else
-    log "skipped $name (download failed)"
-    continue
-  fi
-  SOURCES+=("$TMP/$name.yaml")
-done <"$TMP/pool.tsv"
-[ "${#SOURCES[@]}" -gt 0 ] || fail "no subscription could be fetched"
-
-# 3) 合并（scores 若新鲜则按其排序，否则退回订阅顺序）
-"$PY" "$SHELL_DIR/merge.py" "$TMP/config.yaml" "${SOURCES[@]}"
-
-# 4) 内核自检：唯一权威的配置校验。geo 数据缺失时先报真因，而不是让 -t 报"配置被拒"
 for f in geoip.metadb geosite.dat; do
-  [ -s "$DATA_DIR/assets/$f" ] || fail "missing $DATA_DIR/assets/$f (run tools/seed_dev.sh)"
+  if [ -s "$DATA_DIR/assets/$f" ]; then
+    install -m 644 "$DATA_DIR/assets/$f" "$CACHE/$f.new"
+    mv -f "$CACHE/$f.new" "$CACHE/$f"
+  fi
+  [ -s "$CACHE/$f" ] || fail "missing geo data: $f (run tools/seed_dev.sh)"
 done
-cp -f "$DATA_DIR/assets/geoip.metadb" "$DATA_DIR/assets/geosite.dat" "$CACHE"/
-mihomo -t -d "$CACHE" -f "$TMP/config.yaml" >/dev/null || fail "kernel rejected the generated config"
 
-reload() {
-  # payload 取自传入文件（通常是尚未安装的临时文件）：内核只允许 path 方式重载
-  # -d 目录内的路径；重载失败时磁盘配置保持不变。
-  "$PY" - "$API" "$SECRET" "$1" <<'PY'
-import json, sys, time, urllib.request
+validate_candidate() {
+  local result=0
+  "$PY" "$TOOLS_DIR/rules.py" prepare "$1" "$CACHE" "${@:2}" 2>"$TMP/rules.status" || result=$?
+  cat "$TMP/rules.status" >&2
+  if grep -q '^degraded:' "$TMP/rules.status"; then DEGRADED=1; fi
+  [ "$result" = "0" ] && mihomo -t -d "$CACHE" -f "$1" >/dev/null
+}
 
-api, secret, path = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(path, encoding="utf-8") as fh:
-    body = json.dumps({"payload": fh.read()}).encode()
-last = None
-for _ in range(30):
-    req = urllib.request.Request(
-        api + "/configs?force=true",
-        data=body,
-        method="PUT",
-        headers={"Authorization": "Bearer " + secret, "Content-Type": "application/json"},
-    )
-    try:
-        urllib.request.urlopen(req, timeout=60).read()
-        sys.exit(0)
-    except Exception as exc:  # 内核可能还没起来，重试到超时
-        last = exc
-        time.sleep(2)
-raise SystemExit(f"reload rejected: {last}")
-PY
+build_probe() {
+  mkdir -p "$DATA_DIR/probe"
+  "$PY" "$SHELL_DIR/make_probe_config.py" "$1" "$TMP/probe-config.yaml" --secret "$SECRET" &&
+    mihomo -t -d "$DATA_DIR/probe" -f "$TMP/probe-config.yaml" >/dev/null
+}
+
+install_probe() {
+  mv -f "$TMP/probe-config.yaml" "$ARTIFACTS/probe-config.yaml"
+}
+
+use_installed() {
+  cp "$ARTIFACTS/config.yaml" "$TMP/config.yaml" &&
+    "$PY" "$SHELL_DIR/merge.py" --restore "$TMP/config.yaml" &&
+    validate_candidate "$TMP/config.yaml" --use-existing &&
+    build_probe "$TMP/config.yaml"
 }
 
 install_config() {
@@ -134,17 +107,10 @@ install_config() {
 }
 
 reload_and_install() {
-  # 正常路径：重载成功后才落盘，重载被拒时磁盘保留旧配置。
-  if reload "$1"; then
-    install_config "$1"
-    return 0
-  fi
-  if [ -f "$ARTIFACTS/.config-installed" ]; then
+  # The initialized file is replaced only if the running kernel accepts the candidate.
+  "$PY" "$TOOLS_DIR/reload.py" "$API" "$SECRET" "$1" ||
     fail "reload rejected - keeping the previous on-disk config"
-  fi
-  # 首次启动：磁盘还没有配置，内核也就不可能热重载。先落盘让内核能起来，明确要求重启。
   install_config "$1"
-  fail "reload rejected - installed config for first boot; restart core and re-run update"
 }
 
 warm() {
@@ -177,47 +143,83 @@ for group in cfg.get("proxy-groups") or []:
 PY
 }
 
-sync_probe_core() {
-  # 探测内核（global 模式）用同一批节点，节点表变了要重新生成并热重载它。
-  # 失败不影响主流程：纯净度只是评分的一个维度，缺了会按“无数据”处理。
-  [ -n "${PROBE_API:-}" ] || return 0
-  "$PY" "$SHELL_DIR/make_probe_config.py" "$ARTIFACTS/config.yaml" \
-    "$ARTIFACTS/probe-config.yaml" --secret "$SECRET" >/dev/null \
-    || { log "probe config generation failed"; return 0; }
-  "$PY" "${TOOLS_DIR:-/opt/tools}/reload.py" "$PROBE_API" "$SECRET" \
-    "$ARTIFACTS/probe-config.yaml" --retries 5 --delay 1 >/dev/null 2>&1 \
-    && log "probe core synced" || log "probe core reload skipped"
+if [ "${INIT_ONLY:-0}" = "1" ] && [ -f "$ARTIFACTS/.config-installed" ] &&
+   [ -s "$ARTIFACTS/config.yaml" ] && use_installed; then
+  install_probe
+  install_config "$TMP/config.yaml"
+  log "validated installed configuration (offline bootstrap)"
+  DEGRADED=1
+  exit 0
+fi
+
+SOURCE_CACHE=$DATA_DIR/subscription-cache
+install -d -m 700 "$SOURCE_CACHE"
+"$PY" "$SHELL_DIR/subscriptions.py" "$SECRETS" "$SOURCE_CACHE" "$TMP/sources" "$TMP/pending" >"$TMP/sources.list" 2>"$TMP/sources.status" || {
+  cat "$TMP/sources.status" >&2
+  fail "subscription refresh stopped"
+}
+cat "$TMP/sources.status" >&2
+if grep -q "^degraded:" "$TMP/sources.status"; then DEGRADED=1; fi
+mapfile -t SOURCES <"$TMP/sources.list"
+
+"$PY" "$SHELL_DIR/merge.py" "$TMP/config.yaml" "${SOURCES[@]}"
+rule_options=()
+if [ "${INIT_ONLY:-0}" = "1" ]; then rule_options+=(--use-existing); fi
+validate_candidate "$TMP/config.yaml" "${rule_options[@]}" || fail "candidate failed validation"
+if [ -n "${PROBE_API:-}" ] || [ "${INIT_ONLY:-0}" = "1" ]; then
+  build_probe "$TMP/config.yaml" || fail "probe candidate failed validation"
+fi
+
+save_subscriptions() {
+  shopt -s nullglob
+  for source in "$TMP/pending/"*.yaml; do
+    chmod 600 "$source"
+    mv -f "$source" "$SOURCE_CACHE/"
+  done
+  for source in "$SOURCE_CACHE/"*.yaml; do
+    if ! grep -Fqx -- "${source##*/}" "$TMP/pending/active"; then
+      rm -- "$source"
+    fi
+  done
+  shopt -u nullglob
 }
 
-SECRET=$MIHOMO_SECRET
-export MIHOMO_CONFIG=$CONFIG MIHOMO_SECRET=$SECRET MIHOMO_API=$API MIHOMO_SCORES=$SCORES
-
-# 5) 首次启动（INIT_ONLY）：内核尚未运行，只落盘不重载
 if [ "${INIT_ONLY:-0}" = "1" ]; then
+  install_probe
   install_config "$TMP/config.yaml"
-  # probe-core 依赖 init 完成后再启动，所以这里必须把它的配置也准备好
-  "$PY" "$SHELL_DIR/make_probe_config.py" "$ARTIFACTS/config.yaml" \
-    "$ARTIFACTS/probe-config.yaml" --secret "$SECRET" >/dev/null 2>&1 || true
+  save_subscriptions
   log "bootstrap config installed (init mode)"
   exit 0
 fi
 
-# 5) 先热重载（body 取自临时文件），成功后才落盘：重载被拒时磁盘仍是旧配置
 reload_and_install "$TMP/config.yaml"
-sync_probe_core
+save_subscriptions
+probe_synced=0
+if [ -n "${PROBE_API:-}" ]; then
+  if "$PY" "$TOOLS_DIR/reload.py" "$PROBE_API" "$SECRET" \
+      "$TMP/probe-config.yaml" --retries 5 --delay 1; then
+    install_probe
+    probe_synced=1
+    log "probe core synced"
+  else
+    log "probe core unchanged; skipping purity scan"
+  fi
+fi
 warm "$ARTIFACTS/config.yaml"
 
 if [ "${SKIP_SCORE:-0}" != "1" ]; then
   # 纯净度必须在评分之前：score.py 读同一份快照，把住宅/机房/代理/地区虚标算进总分
-  if [ "${PURITY_ENABLED:-1}" = "1" ] && [ -n "${PROBE_API:-}" ]; then
+  if [ "${PURITY_ENABLED:-1}" = "1" ] && [ "$probe_synced" = "1" ]; then
     log "probing purity (exit IP per node, pace ${PURITY_PACE:-1.5}s)"
-    "$PY" "${TOOLS_DIR:-/opt/tools}/purity.py" --pace "${PURITY_PACE:-1.5}" \
-      --json "${MIHOMO_PURITY:-$ARTIFACTS/purity.json}" --top 5 \
-      || log "purity probe unavailable - scoring continues without it"
-    stamp_p=$(date +%Y%m%dT%H%M%S)
-    [ -f "${MIHOMO_PURITY:-$ARTIFACTS/purity.json}" ] && \
-      gzip -c "${MIHOMO_PURITY:-$ARTIFACTS/purity.json}" >"$DATA_DIR/archive/purity-$stamp_p.json.gz"
-    ls -1 "$DATA_DIR/archive"/purity-*.json.gz 2>/dev/null | sort | head -n -7 | xargs -r rm -f
+    purity_file=${MIHOMO_PURITY:-$ARTIFACTS/purity.json}
+    if "$PY" "${TOOLS_DIR:-/opt/tools}/purity.py" --pace "${PURITY_PACE:-1.5}" \
+      --json "$purity_file" --top 5 && [ -f "$purity_file" ]; then
+      stamp_p=$(date +%Y%m%dT%H%M%S)
+      gzip -c "$purity_file" >"$DATA_DIR/archive/purity-$stamp_p.json.gz"
+      ls -1 "$DATA_DIR/archive"/purity-*.json.gz | sort | head -n -7 | xargs -r rm -f
+    else
+      log "purity probe unavailable - scoring continues"
+    fi
   fi
   log "scoring (platforms=$SCORE_PLATFORMS samples=$SCORE_SAMPLES prefer=$PREFER_REGION)"
   "$PY" "$SHELL_DIR/score.py" --platforms "$SCORE_PLATFORMS" --samples "$SCORE_SAMPLES" \
@@ -228,7 +230,7 @@ if [ "${SKIP_SCORE:-0}" != "1" ]; then
   ls -1 "$DATA_DIR/archive"/scores-*.json.gz 2>/dev/null | sort | head -n -7 | xargs -r rm -f
 
   "$PY" "$SHELL_DIR/merge.py" "$TMP/config.yaml" "${SOURCES[@]}"
-  mihomo -t -d "$CACHE" -f "$TMP/config.yaml" >/dev/null || fail "kernel rejected the re-ordered config"
+  validate_candidate "$TMP/config.yaml" --use-existing || fail "reordered candidate failed validation"
   reload_and_install "$TMP/config.yaml"
   warm "$ARTIFACTS/config.yaml"
 fi

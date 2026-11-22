@@ -1,11 +1,18 @@
-"""纯净度与巡检的纯逻辑测试：不联网、不起内核。"""
+"""纯净度、探测配置与面板测试，不依赖运行期数据。"""
 
 import importlib.util
+import io
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import yaml
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -83,6 +90,46 @@ class TraceParseTest(unittest.TestCase):
             purity.parse_trace("loc=JP\n")
 
 
+class PuritySnapshotTest(unittest.TestCase):
+    def probe(self, trace_country, classification):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "purity.json"
+            found = {"ip": "203.0.113.7", "country_code": trace_country, "source": "trace"}
+            with (
+                patch.object(purity, "PURITY_MISSING", 40.0, create=True),
+                patch.multiple(
+                    purity, secret=lambda: "test",
+                    nodes=lambda _: ["日本A"], select=lambda *_: True,
+                    reachable=lambda *_: True, exit_ip_via_node=lambda _: found,
+                    classify=classification,
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(purity.main(["purity.py", "--json", str(output)]), 0)
+            return json.loads(output.read_text())["nodes"]["日本A"]
+
+    def test_classification_failure_scores_as_unknown(self):
+        result = self.probe("JP", Mock(side_effect=TimeoutError("lookup timed out")))
+        self.assertEqual(result["purity"], 40.0)
+        self.assertEqual(result["reason"], "unclassified")
+        self.assertIsNone(result["hosting"])
+        self.assertIsNone(result["proxy"])
+        self.assertTrue(result["region_match"])
+
+    def test_country_code_matches_the_scoring_decision(self):
+        for observed, expected, matches, score in (
+            ("US", "US", False, 30.0),
+            (None, "JP", True, 55.0),
+        ):
+            with self.subTest(observed=observed):
+                result = self.probe("JP", Mock(return_value={
+                    "country_code": observed, "hosting": True, "proxy": False,
+                }))
+                self.assertEqual(result["country_code"], expected)
+                self.assertIs(result["region_match"], matches)
+                self.assertEqual(result["purity"], score)
+
+
 class WatchdogVerdictTest(unittest.TestCase):
     def test_majority_rule(self):
         wd = load("watchdog_mod", os.path.join(ROOT, "tools", "watchdog.py"))
@@ -116,12 +163,33 @@ class ScanConfigTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             make.build({}, 7899, "s", "0.0.0.0:9090")
 
+    def test_probe_config_is_private_before_and_after_install(self):
+        make = load("mkprobe_private", os.path.join(ROOT, "shell", "make_probe_config.py"))
+        replace = os.replace
 
-class UiStateTest(unittest.TestCase):
-    """面板状态聚合：分数、纯净度、选路三者对不上时要能降级而不是崩。"""
+        def check_temporary_mode(src, dst):
+            self.assertEqual(stat.S_IMODE(Path(src).stat().st_mode), 0o600)
+            replace(src, dst)
 
-    def test_render_with_scores_and_purity(self):
-        ui = load("ui_mod", os.path.join(ROOT, "tools", "ui.py"))
+        for exists in (False, True):
+            with self.subTest(exists=exists), tempfile.TemporaryDirectory() as tmp:
+                src = Path(tmp) / "config.yaml"
+                dst = Path(tmp) / "probe.yaml"
+                src.write_text(yaml.safe_dump({"proxies": [{"name": "n1", "password": "test"}]}))
+                if exists:
+                    dst.write_text("previous config")
+                    dst.chmod(0o644)
+                with patch.object(make.os, "replace", side_effect=check_temporary_mode):
+                    self.assertEqual(make.main(["make", str(src), str(dst), "--secret", "test"]), 0)
+                self.assertEqual(stat.S_IMODE(dst.stat().st_mode), 0o600)
+                self.assertEqual(yaml.safe_load(dst.read_text())["secret"], "test")
+                self.assertEqual(set(Path(tmp).iterdir()), {src, dst})
+
+
+class DiagnosticsSnapshotTest(unittest.TestCase):
+    def test_publish_scores_without_raw_log_details_or_controller_secrets(self):
+        with patch.object(sys, "path", [os.path.join(ROOT, "tools"), *sys.path]):
+            diagnostic = load("diagnostic_mod", os.path.join(ROOT, "tools", "diagnostics.py"))
         scores = {
             "generated": "2026-11-20T10:00:00+08:00",
             "platforms": {"gstatic": 0.9},
@@ -140,23 +208,17 @@ class UiStateTest(unittest.TestCase):
             },
         }
         with tempfile.TemporaryDirectory() as tmp:
-            os.makedirs(os.path.join(tmp, "artifacts"), exist_ok=True)
-            for name, doc in (("scores.json", scores),):
-                with open(os.path.join(tmp, "artifacts", name), "w", encoding="utf-8") as fh:
-                    json.dump(doc, fh)
-            ui.DATA_DIR = tmp
-            ui.ARTIFACTS = os.path.join(tmp, "artifacts")
-            ui.SCORES = os.path.join(ui.ARTIFACTS, "scores.json")
-            ui.PURITY = os.path.join(ui.ARTIFACTS, "purity.json")
-            ui.RUN_LOG = os.path.join(tmp, "run.log")
-            ui.API = "http://127.0.0.1:1"  # 内核不可达 -> 组为空，页面仍要能出
-            st = ui.state()
-            page = ui.render(st)
-        self.assertEqual(len(st["nodes"]), 1)
-        self.assertEqual(st["nodes"][0]["purity"], 55.0)
-        self.assertEqual(st["nodes"][0]["country"], "JP")
-        self.assertIn("mihomo-stack", page)
-        self.assertIn("日本A", page)
+            path = Path(tmp) / "run.log"
+            path.write_text(json.dumps({
+                "phase": "watchdog", "status": "degraded", "group": "出口",
+                "detail": "https://example.invalid/?token=secret",
+            }), encoding="utf-8")
+            state = diagnostic.make_snapshot(scores, {}, diagnostic.read_events(path), None)
+        self.assertEqual(len(state["nodes"]), 1)
+        self.assertEqual(state["nodes"][0]["purity"], 55.0)
+        self.assertEqual(state["nodes"][0]["country"], "JP")
+        self.assertEqual(state["events"][0]["status"], "degraded")
+        self.assertNotIn("secret", json.dumps(state))
 
 
 if __name__ == "__main__":

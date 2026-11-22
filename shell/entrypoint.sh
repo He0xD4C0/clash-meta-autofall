@@ -39,6 +39,10 @@ case "$MODE" in
     ;;
   validate)
     mihomo -t -d "$DATA_DIR/cache" -f "$DATA_DIR/artifacts/config.yaml"
+    python3 "${TOOLS_DIR:-/opt/tools}/rules.py" check "$DATA_DIR/artifacts/config.yaml" "$DATA_DIR/cache"
+    if [ -n "${MIHOMO_API:-}" ]; then
+      python3 "${TOOLS_DIR:-/opt/tools}/rules.py" live "$DATA_DIR/artifacts/config.yaml"
+    fi
     exec python3 "${TOOLS_DIR:-/opt/tools}/validate.py" tree "$DATA_DIR"
     ;;
   scheduler)
@@ -52,11 +56,8 @@ case "$MODE" in
     shift || true
     exec python3 "${TOOLS_DIR:-/opt/tools}/purity.py" "$@"
     ;;
-  ui)
-    exec python3 "${TOOLS_DIR:-/opt/tools}/ui.py"
-    ;;
   *)
-    echo "usage: entrypoint.sh {update|loop|score|validate|scheduler|watchdog|purity|ui}" >&2
+    echo "usage: entrypoint.sh {init|update|loop|score|validate|scheduler|watchdog|purity}" >&2
     exit 2
     ;;
 esac

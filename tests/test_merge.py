@@ -9,6 +9,7 @@ import io
 import os
 import unittest
 from contextlib import redirect_stderr
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -25,7 +26,10 @@ class ScoreTableTests(unittest.TestCase):
         merge = load("merge_bad")
         merge.SCORES = os.path.join(ROOT, "tests", "fixtures", "scores.malformed.json")
         err = io.StringIO()
-        with redirect_stderr(err):
+        with (
+            patch.object(merge.time, "time", return_value=os.path.getmtime(merge.SCORES)),
+            redirect_stderr(err),
+        ):
             table = merge._score_table()
         self.assertIn("good", table)
         self.assertNotIn("broken", table)

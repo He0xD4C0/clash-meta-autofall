@@ -7,7 +7,7 @@ ARG CORE_IMAGE=metacubex/mihomo:v1.19.33
 ARG CORE_BIN=/mihomo
 FROM ${CORE_IMAGE} AS core
 
-FROM alpine:3.20
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 
 # COPY 里引用的 ARG 必须在所在 stage 内重新声明，否则会被展开成空串
 ARG CORE_BIN=/mihomo
